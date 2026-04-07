@@ -124,7 +124,7 @@ def load_conversations_from_zip(zip_bytes, sender_name):
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         message_files = [
             f for f in zf.namelist()
-            if re.search(r'messages/inbox/[^/]+/message_\d+\.json', f)
+                            if re.search(r'inbox/[^/]+/message.*\.json', f)
         ]
 
         folder_map = {}
