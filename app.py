@@ -116,80 +116,136 @@ NOW = datetime.now(timezone.utc)
 # STEP 1 — LOAD ZIP
 # ─────────────────────────────────────────
 
-def load_conversations_from_zip(zip_bytes, sender_name):
-    """Extract all conversations from a Facebook Messenger zip export."""
+def _parse_json_data(data, sender_lower, folder_name):
+    """Parse a single Facebook message JSON dict into a conversation dict. Returns None if empty."""
+    participants = [fix_encoding(p.get('name', '')) for p in data.get('participants', [])]
+    all_messages = []
+    for m in data.get('messages', []):
+        sender = fix_encoding(m.get('sender_name', ''))
+        content = fix_encoding(m.get('content', ''))
+        ts = m.get('timestamp_ms', 0) / 1000
+        all_messages.append({'sender': sender, 'content': content, 'timestamp': ts})
+
+    if not all_messages:
+        return None
+
+    other_names = [p for p in participants if p.lower() != sender_lower]
+    contact_name = other_names[0] if other_names else folder_name
+
+    my_messages = [m for m in all_messages if m['sender'].lower() == sender_lower]
+    all_messages_sorted = sorted(all_messages, key=lambda x: x['timestamp'])
+    last_ts = all_messages_sorted[-1]['timestamp'] if all_messages_sorted else 0
+    last_msg = all_messages_sorted[-1]['content'][:120] if all_messages_sorted else ''
+    days_since = int((NOW.timestamp() - last_ts) / 86400) if last_ts else 9999
+
+    all_text = ' '.join(m['content'] for m in all_messages)
+    raw_phones = extract_phones_from_text(all_text)
+    phone = None
+    for rp in raw_phones:
+        p = clean_phone(rp)
+        if p:
+            phone = p
+            break
+
+    return {
+        'folder': folder_name,
+        'contact_name': contact_name,
+        'participants': participants,
+        'my_messages': [m['content'] for m in my_messages],
+        'all_messages': all_messages_sorted,
+        'total_messages': len(all_messages),
+        'my_message_count': len(my_messages),
+        'last_timestamp': last_ts,
+        'last_message': last_msg,
+        'days_since': days_since,
+        'phone': phone,
+    }
+
+
+def load_conversations_from_file(file_bytes, sender_name, filename='upload'):
+    """Load conversations from a Facebook Messenger export.
+    Accepts:
+      - Facebook's original ZIP (messages/inbox/.../message_N.json)
+      - A manually-zipped JSON file or folder
+      - A raw .json file uploaded directly
+    """
     conversations = []
     sender_lower = sender_name.lower().strip()
+    fname = filename.lower()
 
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+    # ── Direct JSON upload ──────────────────────────────────────────────────
+    if fname.endswith('.json'):
+        try:
+            raw = file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            raw = file_bytes.decode('latin-1')
+        data = json.loads(raw)
+        conv = _parse_json_data(data, sender_lower, 'conversation')
+        if conv:
+            conversations.append(conv)
+        return conversations
+
+    # ── ZIP upload ──────────────────────────────────────────────────────────
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        all_names = zf.namelist()
+
+        # Try standard Facebook export path first
         message_files = [
-            f for f in zf.namelist()
-                            if re.search(r'inbox/[^/]+/message.*\.json', f)
+            f for f in all_names
+            if re.search(r'messages/inbox/[^/]+/message_\d+\.json', f)
         ]
 
-        folder_map = {}
-        for mf in message_files:
-            parts = mf.split('/')
-            folder = parts[parts.index('inbox') + 1]
-            folder_map.setdefault(folder, []).append(mf)
+        if message_files:
+            # Standard Facebook export — group by conversation folder
+            folder_map = {}
+            for mf in message_files:
+                parts = mf.split('/')
+                folder = parts[parts.index('inbox') + 1]
+                folder_map.setdefault(folder, []).append(mf)
 
-        for folder, files in folder_map.items():
-            all_messages = []
-            participants = []
-            for f in sorted(files):
-                with zf.open(f) as fh:
-                    data = json.load(fh)
-                    if not participants:
-                        participants = [fix_encoding(p.get('name', '')) for p in data.get('participants', [])]
-                    msgs = data.get('messages', [])
-                    for m in msgs:
-                        sender = fix_encoding(m.get('sender_name', ''))
-                        content = fix_encoding(m.get('content', ''))
-                        ts = m.get('timestamp_ms', 0) / 1000
-                        all_messages.append({
-                            'sender': sender,
-                            'content': content,
-                            'timestamp': ts
-                        })
+            for folder, files in folder_map.items():
+                merged_data = {'participants': [], 'messages': []}
+                for f in sorted(files):
+                    with zf.open(f) as fh:
+                        data = json.load(fh)
+                        if not merged_data['participants']:
+                            merged_data['participants'] = data.get('participants', [])
+                        merged_data['messages'].extend(data.get('messages', []))
+                conv = _parse_json_data(merged_data, sender_lower, folder)
+                if conv:
+                    conversations.append(conv)
 
-            if not all_messages:
-                continue
+        else:
+            # Fallback: find any JSON files in the ZIP that look like FB message exports
+            json_files = [f for f in all_names if f.endswith('.json') and not f.startswith('__')]
 
-            # Determine the other participant's name
-            other_names = [p for p in participants if p.lower() != sender_lower]
-            contact_name = other_names[0] if other_names else folder
+            # Group by directory so multi-part conversations merge correctly
+            dir_map = {}
+            for jf in json_files:
+                dir_key = '/'.join(jf.split('/')[:-1]) or 'root'
+                dir_map.setdefault(dir_key, []).append(jf)
 
-            # Split messages by sender
-            my_messages = [m for m in all_messages if m['sender'].lower() == sender_lower]
-            all_messages_sorted = sorted(all_messages, key=lambda x: x['timestamp'])
-            last_ts = all_messages_sorted[-1]['timestamp'] if all_messages_sorted else 0
-            last_msg = all_messages_sorted[-1]['content'][:120] if all_messages_sorted else ''
-
-            days_since = int((NOW.timestamp() - last_ts) / 86400) if last_ts else 9999
-
-            # Extract phones from all content
-            all_text = ' '.join(m['content'] for m in all_messages)
-            raw_phones = extract_phones_from_text(all_text)
-            phone = None
-            for rp in raw_phones:
-                p = clean_phone(rp)
-                if p:
-                    phone = p
-                    break
-
-            conversations.append({
-                'folder': folder,
-                'contact_name': contact_name,
-                'participants': participants,
-                'my_messages': [m['content'] for m in my_messages],
-                'all_messages': all_messages_sorted,
-                'total_messages': len(all_messages),
-                'my_message_count': len(my_messages),
-                'last_timestamp': last_ts,
-                'last_message': last_msg,
-                'days_since': days_since,
-                'phone': phone,
-            })
+            for dir_key, files in dir_map.items():
+                merged_data = {'participants': [], 'messages': []}
+                for f in sorted(files):
+                    with zf.open(f) as fh:
+                        try:
+                            raw = fh.read()
+                            try:
+                                data = json.loads(raw.decode('utf-8'))
+                            except UnicodeDecodeError:
+                                data = json.loads(raw.decode('latin-1'))
+                            if 'messages' not in data:
+                                continue  # skip non-message JSONs
+                            if not merged_data['participants']:
+                                merged_data['participants'] = data.get('participants', [])
+                            merged_data['messages'].extend(data.get('messages', []))
+                        except Exception:
+                            continue
+                folder_name = dir_key.split('/')[-1] or files[0].split('/')[-1].replace('.json', '')
+                conv = _parse_json_data(merged_data, sender_lower, folder_name)
+                if conv:
+                    conversations.append(conv)
 
     return conversations
 
@@ -261,7 +317,7 @@ def analyse_voice(my_messages):
             if last in '.!?':
                 end_punct[last] += 1
             else:
-                end_punct['none'] += 1
+                end_punctW'none'] += 1
     no_punct_pct = round(end_punct.get('none', 0) / len(my_messages) * 100, 1) if my_messages else 0
 
     avg_len = round(sum(len(m.split()) for m in my_messages) / len(my_messages), 1) if my_messages else 0
@@ -615,9 +671,9 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.markdown("### 📁 Upload Facebook Export")
     uploaded_file = st.file_uploader(
-        "Upload your Facebook Messenger export (.zip)",
-        type=['zip'],
-        help="Download from Facebook: Settings → Your Information → Download Your Information → Messages"
+        "Upload your Facebook Messenger export (.zip or .json)",
+        type=['zip', 'json'],
+        help="Upload Facebook's export ZIP, a manually-zipped JSON file, or a raw message_1.json file directly."
     )
 with col2:
     st.markdown("### 👤 Salesperson Name")
@@ -632,11 +688,11 @@ if uploaded_file and sender_name:
     if st.button("🔥 Run Rekindl Analysis", use_container_width=True, type="primary"):
         with st.spinner("Processing your data... this may take a minute for large exports."):
             try:
-                zip_bytes = uploaded_file.read()
+                file_bytes = uploaded_file.read()
 
                 # Load conversations
                 progress = st.progress(0, text="Loading conversations...")
-                conversations = load_conversations_from_zip(zip_bytes, sender_name)
+                conversations = load_conversations_from_file(file_bytes, sender_name, uploaded_file.name)
                 progress.progress(33, text=f"Loaded {len(conversations)} conversations. Running brand voice analysis...")
 
                 # Brand voice
