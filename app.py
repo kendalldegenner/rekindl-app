@@ -317,7 +317,7 @@ def analyse_voice(my_messages):
             if last in '.!?':
                 end_punct[last] += 1
             else:
-                end_punctW'none'] += 1
+                end_punct['none'] += 1
     no_punct_pct = round(end_punct.get('none', 0) / len(my_messages) * 100, 1) if my_messages else 0
 
     avg_len = round(sum(len(m.split()) for m in my_messages) / len(my_messages), 1) if my_messages else 0
